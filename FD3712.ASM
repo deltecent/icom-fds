@@ -9,15 +9,16 @@
 ;  Other iCOM software (e.g., FDOS, DEBBI) uses yet another PROM and
 ;  locates the PROM at C000h.
 ;
-;  Disassembled by Patrick Linstruth, January, 2021.
-;  Based on FD3812 disassembly by Mike Douglas, November, 2020.
+;  Disassembled by Mike Douglas, November, 2020.
 ;
 ;--------------------------------------------------------------------------
 
-PROM	equ	0f000h		;address of prom
-PRAM	equ	PROM+0400h	;address of ram
+; Interface board equates
 
-; FD3812 controller commands
+ROMBASE	equ	0F000h		;base address of PROM
+RAMBASE	equ	0F400h		;start of RAM on the interface board
+
+; FD3712 controller commands
 
 cSTATUS	equ	00h		;read status
 cREAD	equ	03h		;read sector
@@ -30,13 +31,14 @@ cSETTRK	equ	11h		;set track to seek
 cDRVSEC	equ	21h		;set unit and sector
 cWRTBUF	equ	31h		;write buffer
 cRDBUF	equ	40h		;read buffer
-cSRDBUF	equ	41h		;shift read buffer
+cSHIFT	equ	41h		;shift read buffer
 cRESET	equ	81h		;reset the contorller
 cLDCFG	equ	15h		;load configuration
 
 ; Controller status bits
 
 sBUSY	equ	01h		;1=busy
+sSKERR	equ	02h		;1=seek error
 sCRCERR	equ	08h		;1=CRC error
 sWRTPRT	equ	10h		;1=write protected
 sNOTRDY	equ	20h		;1=drive not ready
@@ -56,38 +58,33 @@ WARMJMP	equ	0		;warm boot jump address
 BDOSJMP	equ	5		;BDOS jump address
 DEFDRV	equ	4		;CP/M default drive address
 
-RAW	equ	40H		;read after wrt
-
 ; Drive equates
 
-NUMSEC	equ	26		;CP/M sectors per SD track
+NUMSEC	equ	26		;sectors per track
+SECLEN	equ	128		;length of sector
 
-; Other equates
+; Misc equates
 
-CR	equ	0Dh		;carrige return
-LF	equ	0Ah		;line feed
-BS	equ	8		;back sp
-TAB	equ	9		;tab char
-
-;--------------------------------------------------------------------------
-;I/O VECTORS IN INTERFACE "ON BOARD" RAM
-;--------------------------------------------------------------------------
-
-CINIT	EQU	PRAM
-WINIT	EQU	PRAM+3
-CONST	EQU	PRAM+6
-CONIN	EQU	PRAM+9
-CONOUT	EQU	PRAM+0CH
-LIST	EQU	PRAM+0FH
-PUNCH	EQU	PRAM+12H
-READER	EQU	PRAM+15H
+CR	equ	0Dh
+LF	equ	0Ah
+BS	equ	08h
+TAB	equ	09h
 
 ;--------------------------------------------------------------------------
 ; Interface board RAM
 ;--------------------------------------------------------------------------
-	org	PRAM		;start of RAM on the interface board
+	org	RAMBASE		;start of RAM on the interface board
 
-	ds	20h		;not used by PROM
+RAMVECS	equ	$		;BIOS vectors in interface RAM
+rCold	ds	3		;cold start
+rWarm	ds	3		;warm start
+rConSt	ds	3		;console status
+rConIn	ds	3		;console character in 
+rConOut	ds	3		;console character out
+rList	ds	3		;list character out
+rPunch	ds	3		;punch character out
+rReader	ds	3		;reader character in
+	ds	8
 
 ; The following 16 bytes, starting at F420, are copied from the CP/M boot 
 ;   image into this area during cold boot. The data starts 16 bytes before
@@ -95,105 +92,101 @@ READER	EQU	PRAM+15H
 
 PARAMS	equ	$		;parameter table copied from CP/M image
 verStr	ds	7		;version string
-densTrk	ds	1		;density has been set on the controller
-				;  for this track number, else FFh
-densTbl	ds	4		;density table per drive (four drives)
-				;  value of 2 means double density
+drvTrk	ds	1		;track num the drive is known to be on
+	ds	4
 bufPtr	ds	2		;pointer to a buffer for write buffering
 	ds	1
 wrtVfy	ds	1		;write verify is 40h bit in this byte
-	
-; Remaining RAM usage
-			
-drvTrk	equ	$		;drive, track from CP/M as word
+
 drvNum	ds	1		;drive number from CP/M
 trkNum	ds	1		;track number from CP/M
 secNum	ds	1		;sector number from CP/M
 dmaAddr	ds	2		;buffer address
+	ds	11
+biosAdr	ds	2		;address of BIOS in RAM
+	ds	5
+	
+lptPos	ds	1		;current position in line buffer
+lptLen	ds	1		;printer line length and cold start flag
+lptPrev	ds	1		;previous character printed
+prevChr	ds	1		;previous character displayed
+bufChr	ds	1		;buffered input character
 
-fDrvTrk	equ	$		;drive, track in read fifo as word
-fifoDrv	ds	1		;drive number in read fifo
-fifoTrk	ds	1		;track number in read fifo
-	ds	1
-fifoPos	ds	1		;current position in read fifo
-
-bDrvTrk	equ	$		;drive, track in write buffer as word
-bufDrv	ds	1		;drive number in write buffer
-bufTrk	ds	1		;track number in write buffer
-bufSec	ds	1		;sector number in write buffer
-	ds	1
-
-cDrvTrk	equ	$		;drive, track of current drive as word
-curDrv	ds	1		;drive number of current drive
-curTrk	ds	1		;track number of current drive
-curSec	ds	1		;sector number of current drive
-
-biosAdr	ds	2		;address of BIOS in RAM (PRAM+40h)
+STACK	equ	RAMBASE+80h	;location of local stack
 
 ;--------------------------------------------------------------------------
-; Start of PROM
+; Start of code
+;--------------------------------------------------------------------------
+	org	ROMBASE
+
+	jmp	boot		;a jump to F000 boots disk
+	db	' ALTAIRC '
+	jmp	bootNC		;F00C: boot, no change to vector table
+	db	15h		;match PROM content
+
+; BIOS jump table
+
+vCold	jmp	cBoot		;after cold boot processing
+	jmp	wBoot		;perform warm boot
+	jmp	rConSt		;console status RAM vector
+	jmp	rConIn		;console character in RAM vector
+	jmp	rConOut		;console character out RAM vector
+	jmp	rList		;list character out RAM vector
+	jmp	rPunch		;punch character out RAM vector
+	jmp	rReader		;reader character in RAM vector
+	jmp	home		;disk home
+	jmp	selDrv		;select drive
+	jmp	setTrk		;set track number
+	jmp	setSec		;set sector number
+	jmp	setDma		;set I/O buffer address
+	jmp	read		;read sector
+	jmp	write		;write sector
+	ret			;close function in 3812
+	db	0,0		;match PROM content
+	jmp	ramByC		;RAMBASE indexed by C
+	jmp	initAll		;initAll
+
+	db	' 3712-V21 (C) LIFEBOAT ASSOCIATES 1979 '
+
+;--------------------------------------------------------------------------
+; boot - load 1st sector from track 0 into RAM at 80h and jump to it
 ;--------------------------------------------------------------------------
 
-	org	PROM
+; (F06D) Jump here to boot using SIO vector table for console I/O
 
-	jmp	entry
+	lxi	h,sioVec	;use SIO vector table
+	jmp	copyTbl
 
-	db	020h,041h,04ch	;match the PROM
-	db	054h,041h,049h	;match the PROM
-	db	052h,043h,020h	;match the PROM
-	db	0c3h,085h,0f0h	;match the PROM
-	db	015h		;match the PROM
+; (F073, default) Jump here to boot using 2SIO vector table for
+;    console I/O
 
-vCold	jmp	cBoot
-	jmp	wBoot
-	jmp	CONST
-	jmp	CONIN
-	jmp	CONOUT
-	jmp	LIST
-	jmp	PUNCH
-	jmp	READER
-	jmp	home
-	jmp	selDrv
-	jmp	setTrk
-	jmp	setSec
-	jmp	setDma
-	jmp	read
-	jmp	write
+boot	lxi	h,sio2Vec	;use 2SIO vector table
+	jmp	copyTbl
 
-	ret			;CLOSE not implemented
-	nop
-	nop
+; (F079) Jump here to boot using monitor C000h PROM for console I/O
 
-	jmp	densC
-	jmp	initAll
+	lxi	h,monVec	;use monitor ROM for console I/O
+	jmp	copyTbl
 
-cpyrght db	' 3712-V21 '
-	db	'(C) LIFEBOAT ASSOCIATES 1979 !'
+copyTbl	lxi	sp,80h		;init stack pointer
+	call	initVec		;init vector table in RAM
 
-	db	0e0h,0f3h	;match the PROM
+; (F085) Jump here to boot without changing the vector table in RAM
 
-	jmp	init
+bootNC	lxi	sp,80h		;init stack pointer
 
-entry	lxi	h,PRAM-010h	;HL->PROM vector table
-	jmp	init
-	lxi	h,PRAM-098h
-	jmp	init
-
-init	lxi	sp,80h		;initialize stack pointer
-	call	ramVec		;make vector table in RAM
-	lxi	sp,80h		;again??
-
-boot	call	initAll		;initialize controller, drives, variables
-	mvi	c,0		;track 0
+ldBoot	call	initAll		;init controller, drives, variables
+	mvi	c,0		;load boot sector from track zero
 	call	setTrk
-	lxi	b,80h		;load sector into RAM at 80h
+	lxi	b,80h		;loading into RAM at 80h
 	call	setDma
-	call	read		;read the sector
-	jnz	boot		;error, try again
-	lxi	h,PRAM		;pass loader the RAM location in DE
-	xchg			;DE->RAM
-	lxi	h,vCold		;and a jump to CP/M cold boot in HL
-	jmp	80h		;jump to boot loader
+	call	read		;read the boot sector
+	jnz	ldBoot		;error, try again
+
+	lxi	h,RAMBASE	;give interface RAM pointer in DE
+	xchg
+	lxi	h,vCold		;cold start jump vector in HL
+	jmp	80h		;jump to boot sector just loaded
 
 ;--------------------------------------------------------------------------
 ; cBoot - CP/M cold boot processing
@@ -209,76 +202,72 @@ cBoot	shld	biosAdr		;save address provided for the BIOS
 
 	lxi	d,-128		;startup msg is 128 bytes before BIOS
 	dad	d
-	xra	a		;initialize LPTLEN
-	sta	LPTLEN
 
-	call	banner		;display it
+	xra	a		;line length of zero means init printer
+	sta	lptLen
+
+	call	banner		;display startup message
 
 	xra	a		;drive 0 is default drive
 	sta	DEFDRV
-
 	jmp	jmpCpm		;init and enter CP/M
 
 ;--------------------------------------------------------------------------
-; wBoot - CP/M warm boot processing. The CP/M image is stored on track
-;   one in double density with a physical sector skew of 3. This means
-;   CP/M sectors are read as follows: 1,2 then 7,8, then 13,14, etc. A
-;   total of three revolutions is required to read every sector.
+; wBoot - CP/M warm boot processing. The CP/M image is stored on tracks
+;   zero and one with a physical sector skew of 3. 
 ;--------------------------------------------------------------------------
-wBoot	lxi	sp,100h		;init stack pointer
+wBoot	lxi	sp,100h		;init stack poiner
 	call	initAll		;init controller, drives, variables
 
-	mvi	c,0		;track 0
+	mvi	c,0		;load starts on track 0	
 	call	setTrk
 
 	lhld	biosAdr		;HL->start of the BIOS
-	lxi	d,-(CCPLEN+BDOSLEN)	;compute start address of the CCP
+	lxi	d,-(CCPLEN+BDOSLEN)  ;compute start address of the CCP
 	dad	d		;HL->start of the CCP in RAM
 
-	inr	h		;HL->CCP + 2 sectors
-	mvi	a,4		;A=sector 4
+	inr	h		;HL->2nd page of CCP
+	mvi	a,4		;start loading at sector 4
+	call	readTrk		;load track 0
 
-	call	wbLoop		;read sectors 2-26 off track 0
-
-	mvi	c,1		;track 1
+	mvi	c,1		;load rest of CP/M from track 1
 	call	setTrk
 
-	lhld	biosAdr
-	lxi	d,-(CCPLEN+BDOSLEN)
-	dad	d		;hl->start address of the CCP
-	lxi	d,25*128
-	dad	d		;hl->CCP + 25 sectors
+	lhld	biosAdr		;compute address for track 1
+	lxi	d,-(CCPLEN+BDOSLEN)  ;compute start address of the CCP
+	dad	d
+	lxi	d,(NUMSEC-1)*SECLEN  ;bytes loaded from track 0
+	dad	d		;HL->where to load track 1
 
-	mvi	a,1		;A=sector 1
-	call	wbLoop
+	mvi	a,1		;start on sector 1
+	call	readTrk		;read a track
+	jmp	jmpCpm		;enter CPM
 
-	jmp	jmpCpm
+readTrk	sta	secNum		;set sector number
+	shld	dmaAddr		;set load address
 
-wbLoop	sta	secNum
-	shld	dmaAddr
-	lda	biosAdr+1	;see if we've reached the BIOS address
-	dcr	a
-	cmp	h		;compare address now to BIOS address
-	jc	wbSkip		;reached the BIOS, don't read
+	lda	biosAdr+1	;MSB of BIOS address
+	dcr	a		;have we reached the BIOS
+	cmp	h
+	jc	wbSkip		;reached BIOS, don't read
 
 	call	read		;read the next sector
 	jnz	wBoot		;error, start over
 
-wbSkip	lhld	dmaAddr
-	lxi	d,3*128	
+wbSkip	lhld	dmaAddr		;HL=start of last sector read
+	lxi	d,3*SECLEN	;3 sector interleave
 	dad	d
-	lda	secNum
-	adi	3
 
+	lda	secNum		;increment sector by 3
+	adi	3
 	cpi	NUMSEC+1	;past last sector?
-	jc	wbLoop
+	jc	readTrk		;no
 
 	sui	NUMSEC		;wrap back to start
-	lxi	d,-(CCPLEN+BDOSLEN-800h)
+	lxi	d,-(NUMSEC*SECLEN)
 	dad	d
-
-	cpi	1		;if back to 1, we're done
-	jnz	wbLoop
+	cpi	1		;if back to sector 1, we're done
+	jnz	readTrk
 
 	ret
 
@@ -318,46 +307,42 @@ banner	mov	a,m		;A=next byte of message
 	ora	a		;exit on zero byte
 	rz
 
-	mov	c,m		;pass character in A
+	mov	c,m		;pass character in C
 	inx	h		;point to next character
 	push	h
 	call	outChar		;call BIOS output character
 	pop	h
 	jmp	banner
 
-outChar	lhld	biosAdr		;point to BIOS entry
-	lxi	d,0ch		;CONOUT entry
+outChar	lhld	biosAdr		;point to BIOS conOut entry
+	lxi	d,0Ch		
 	dad	d
 	pchl			;jump to it
 
 ;--------------------------------------------------------------------------
-; densC - Return density table entry in HL for drive indicated by C
+; ramByC - return pointer in HL to RAMBASE + value passed in C
 ;--------------------------------------------------------------------------
-densC	lxi	h,PRAM		;compute address in drive table
-	mvi	b,0		;BC=offset to drive
-	dad	b		;HL->drive in drive table
+ramByC	lxi	h,RAMBASE
+	mvi	b,0
+	dad	b
 	ret
 
 ;--------------------------------------------------------------------------
-; home - BIOS entry point. Do a restore to track 0 on the current drive.
+; home, setTrk, selDrv, setSec, setDma - standard BIOS entry points
 ;--------------------------------------------------------------------------
 home	jmp	doHome
 
-;--------------------------------------------------------------------------
-; setTrk, selDrv, setSec, setDma - standard BIOS entry points
-;--------------------------------------------------------------------------
 setTrk	mov	a,c		;save track specified in C
 	sta	trkNum
-	ret
+	ret        
 
-selDrv	mov	a,c		;save passed drive number in drvNum
+selDrv	mov	a,c		;save drive number in drvNum
 	sta	drvNum
-
-	mvi	a,0ffh		;indicate that track density is not set
-	sta	densTrk		;  in the controller
+	mvi	a,0FFh		;track num drive is on is not known
+	sta	drvTrk
 	ret
 
-setSec	mov	a,c		;save CP/M sector specified in C
+setSec	mov	a,c		;save sector specified in C
 	sta	secNum
 	ret
 
@@ -365,178 +350,183 @@ setDma	mov	h,b		;save buffer address specified in BC
 	mov	l,c
 	shld	dmaAddr
 	ret
-	
-read	call	selSeek		;select drive, seek to track
-	jnz	errExit		;failed
 
-	mvi	c,10		;retry count
+;--------------------------------------------------------------------------
+; read - BIOS entry point. Read 128 byte CP/M sector from the drive,
+;   track and sector specified in drvNum, trkNum, and secNum. Sector
+;   is moved to the address specified in dmaAddr.
+;--------------------------------------------------------------------------
+read	call	selSeek		;select drive, seek track
+	jnz	errExit		;error
 
-readReq mvi	a,cREAD		;issue read command to the controller
+	mvi	c,10		;C=retry counter
+
+rdRtry	mvi	a,cREAD		;issue read command
 	call	doCmd
-	ani	sNOTRDY+sCRCERR	;check for read errors
-	jz	startRd		;no errors
+	ani	(sNOTRDY+sCRCERR)  ;check read status
+	jz	readXfr		;good read, fo transfer data
 
-	call	clrErrs		;clear errors on the controller
-	dcr	c		;decrement retry count
-	jnz	readReq
+	call	clrErrs		;clear controller errors 
+	dcr	c		;decrement retry counter
+	jnz	rdRtry		;and try again
 
-	jmp	errExit		;give up
+	jmp	errExit		;give up, read failed
 
-startRd lhld	dmaAddr		;hl->user buffer to store sector
-	mvi	c,128		;read 128 bytes from controller
-	mvi	a,cRDBUF	;first byte of read buffer
+readXfr	lhld	dmaAddr		;HL->read destination
+	mvi	c,SECLEN	;C=count of bytes to move
+	mvi	a,cRDBUF	;enable fifo buffer output
 	out	CMDOUT
-	in	DATAIN		;get byte from controller
-	mov	m,a		;save byte in user buffer
+
+	in	DATAIN		;get 1st byte and store
+	mov	m,a
 	inx	h
-	xra	a		;status
-	out	CMDOUT
-	dcr	c		;decrement byte count
 
-rdLoop	mvi	a,cSRDBUF	;shift read buffer to next byte
+	xra	a		;not really needed, bit 0
+	out	CMDOUT		;  already clear
+	dcr	c		;one byte moved
+
+rdLoop	mvi	a,cSHIFT	;shift fifo to next byte
 	out	CMDOUT
-	in	DATAIN		;get byte from controller
-	mov	m,a		;save byte in user buffer
+
+	in	DATAIN		;get the next byte 
+	mov	m,a		;and save in user buffer
 	inx	h
-	xra	a		;status
+
+	xra	a		;set bit zero back to zero
 	out	CMDOUT
-	dcr	c		;decrement byte count
+	dcr	c		;repeat for all bytes
 	jnz	rdLoop
 
 	ret
 
 ;--------------------------------------------------------------------------
 ; write - BIOS entry point. Write 128 byte CP/M sector to the drive,
-;   track and sector specified in drvNum, trkNum, and secNum. Sector
-;   data to be written is specified in dmaAddr. Double density writes
-;   are buffered in RAM at (bufPtr).
+;   track and sector specified in cpmDrv, cpmTrk, and cpmSec. Sector
+;   data to be written is specified in dmaAddr. 
 ;--------------------------------------------------------------------------
 write	call	selSeek		;select drive, seek to track
-	jnz	errExit		;failed
+	jnz	errExit
 
-	lhld	dmaAddr		;HL->user data to write
-	mvi	c,128		;write 128 bytes
+	lhld	dmaAddr		;HL->user buffer
+	mvi	c,SECLEN	;C=count of bytes to move
 
-wrtLoop	mov	a,m		;copy byte from HL
-	out	DATAOUT		;store on controller
-	mvi	a,cWRTBUF	;write buffer
+wrtLoop	mov	a,m		;A=next byte to write
+	out	DATAOUT		;give to controller
+	
+	mvi	a,cWRTBUF	;command to move byte to write buffer
+	out	CMDOUT	
+	xra	a		;return bit zero to zero
 	out	CMDOUT
-	xra	a		;status
-	out	CMDOUT
-	inx	h		;next byte
-	dcr	c		;decrement count
-	jnz	wrtLoop	
+	
+	inx	h		;move to next byte
+	dcr	c
+	jnz	wrtLoop
 
-	mvi	c,10		;c=retry count
+	mvi	c,10		;C=retry counter
 
-wrtSec	mvi	a,cWRITE	;issue write command to the controller
+wrtRtry	mvi	a,cWRITE	;do the write to disk
 	call	doCmd
-	ani	sNOTRDY		;drive not ready?
-	jz	wrtVrfy		;no, verify sector
+	ani	sNOTRDY		;error?
+	jz	chkCrc		;no, go check CRC
 
-	call	clrErrs		;clear errors in the controller
-	jmp	errExit		;give up
+	call	clrErrs		;reset errors
+	jmp	errExit		;and give up
 
-wrtVrfy	lda	wrtVfy		;verify the write?
-	ani	RAW
-	rz			;no
+chkCrc	lda	wrtVfy		;verifying writes?
+	ani	40h		;this bit set if we are
+	rz			;not verifying
 
-	mvi	a,cRDCRC	;issue read CRC to validate
+	mvi	a,cRDCRC	;read sector to check CRC
 	call	doCmd
-	ani	sNOTRDY+sCRCERR	;CRC error?
-	rz			;no
+	ani	(sNOTRDY+sCRCERR)  ;any errors?
+	rz			;no, good write
 
-	call	clrErrs		;clear errors in the controller
+	call	clrErrs		;clear controller errore
 	dcr	c		;decrement retry count
-	jnz	wrtSec
+	jnz	wrtRtry		;and try again
 
-errExit	mvi	a,1		;return with A and status <> 0
+errExit	mvi	a,1		;return with A and status <> 0	
 	ora	a
 	ret
 
 ;--------------------------------------------------------------------------
 ; selSeek - Select current drive, seek to current track, give
-;   controller current sector to look for
+;    controller current sector to look for
 ;--------------------------------------------------------------------------
-selSeek	xra	a		;set single density
+selSeek	xra	a		;clear configuration bits
 	out	DATAOUT
-	mvi	a,cLDCFG
-
+	mvi	a,cLDCFG	;issue the command
 	call	outCmd
-	call	drvSec		;set drive and sector
-	call	seek		;seek to curTrk
 
-	ret			;zero if no error
+	call	selSec		;select drive, set sector
+	call	seek		;seek to requested track
+	ret
 
-;--------------------------------------------------------------------------
-; drvSec - Select current drive, give controller current sector
-;   to look for
-;--------------------------------------------------------------------------
-drvSec	lda	drvNum		;A=drive number
-	ani	03h		;only allow 0-3
-	rrc			;move to bits 6-7
+selSec	lda	drvNum		;get drive number 0-3
+	ani	03h
+	rrc			;put drive number in upper two bits
 	rrc
-	mov	c,a		;save in C
-	lda	secNum		;A=sector number
-	ora	c		;add drive number
-	out	DATAOUT
-	mvi	a,cDRVSEC	;set drive and sector
-	call	outCmd
+	mov	c,a		;C=drive in upper two bits
 
+	lda	secNum		;combine drive with sector number
+	ora	c
+	out	DATAOUT		;give to controller
+
+	mvi	a,cDRVSEC	;issue set sector command
+	call	outCmd
 	ret
 
 ;--------------------------------------------------------------------------
-; seek - Seek to curTrk. 
+; seek - Seek to curTrk. Set density in the controller for the track
+;    using the load configuration command.
 ;--------------------------------------------------------------------------
-seek	mvi	c,2		;c=retry count
-	lda	trkNum		;A=current track
-	lxi	h,densTrk	;HL->controller density
-	cmp	m		;density set for this track?
-	rz			;yes, so we're already on right track
+seek	mvi	c,2		;C=retry counter
 
-	mov	m,a		;this track will now have density set
+	lda	trkNum		;A=requested track	
+	lxi	h,drvTrk	;HL->track drive is on
+	cmp	m		;on right track already?
+	rz			;yes
 
-	lda	trkNum		;set track number in controller
+	mov	m,a		;save track drive is on
+	lda	trkNum		;give new track # to controller
 	out	DATAOUT
-	mvi	a,cSETTRK	;set track to seek
-	call	outCmd	
+	
+	mvi	a,cSETTRK	;and issue set track command
+	call	outCmd
 
-	mvi	a,cSEEK		;use seek command
+	mvi	a,cSEEK		;seek to the track specified
 	call	doCmd
-	ani	sNOTRDY+sCRCERR	;check for read errors
-	rz			;exit if no errors
+	ani	(sNOTRDY+sCRCERR)   ;seek error?
+	rz			;no, exit
 
-	call	clrErrs		;clear errors on controller
-	mvi	m,0ffh		;density not set
-	dcr	c		;decrement retry count
-	jnz	seek
+	call	clrErrs		;else, clear controller errors
+	mvi	m,0FFh		;track not valid yet	
+	dcr	c		;decrement retry counter
+	jnz	seek		;** will loop forever **
 
-	call	reset0		;reset controller, restore to track 0
-
-	mvi	a,2		;clear zero flag
-	ora	a
+	call	reset0		;reset controller, seek track 0
+	mvi	a,sSKERR	;return seeke error
+	ora	a		;force non-zero status
 	ret
 
 ;--------------------------------------------------------------------------
 ; initAll - Initialize variables, reset controller, restore drive 0
-;   to track 0
+;    to track 0
 ; reset0 - reset controller, restore current drive to track 0
 ; doHome - restore current drive to track 0
 ;--------------------------------------------------------------------------
-initAll xra	a
-	sta	drvNum		;set current drive=0
-	inr	a
-	sta	secNum		;set current sector=1
+initAll	xra	a		;default to drive 0
+	sta	drvNum
+	inr	a		;default to sector 1
+	sta	secNum
 
-reset0	mvi	a,cRESET	;reset controller	
+reset0	mvi	a,cRESET	;reset controller
 	call	outCmd
 
-doHome	call	drvSec		;set drive and sector on the controller
-
-	mvi	a,0ffh		;no track density set
-	sta	densTrk
-
-	mvi	a,cRESTOR	;restore to track 0
+doHome	call	selSec		;select drive and sector
+	mvi	a,0FFh		;current drive track not known
+	sta	drvTrk
+	mvi	a,cRESTOR	;issue restore to track 0
 				;fall into doCmd
 
 ;--------------------------------------------------------------------------
@@ -554,7 +544,7 @@ waitCmd	in	DATAIN		;wait for not busy
 
 ;--------------------------------------------------------------------------
 ; clrErrs - Issue the clear errors command to the controller
-; outCmd - Issue the command in A to the controoler
+; outCmd - Issue the command in A to the controller
 ;--------------------------------------------------------------------------
 clrErrs	mvi	a,cCLRERR	;clear controller errors
 
@@ -566,241 +556,290 @@ outCmd	out	CMDOUT		;give command to the controller
 ;--------------------------------------------------------------------------
 ; moveH2D - move B bytes from (HL) to (DE)
 ;--------------------------------------------------------------------------
-
-moveH2D	mov	a,m		;copy byte from (HL) to (DE)	
+moveH2D	mov	a,m
 	stax	d
 	inx	h
 	inx	d
-	dcr	b		;decrement byte count
+	dcr	b
 	jnz	moveH2D
-
 	ret
 
-;--------------------------------------------------------------------------
-; Create vector in PRAM from table in HL
-;--------------------------------------------------------------------------
-ramVec	lxi	d,PRAM		;DE->TOP of iCOM RAM
-	mvi	b,((VREADER-VCINIT)/2)+1
-
-vecLp	mvi	a,JMP		;JMP opcode
-	stax	d		;store in PRAM
-	inx	d		;de=de+1
-	mov	a,m		;get lsb vector
-	stax	d		;store in PRAM
-	inx	h		;hl=hl+1
-	inx	d		;de=de+1
-	mov	a,m		;get msb vector
-	stax	d		;store in PRAM
-	inx	h		;hl=hl+1
-	inx	d		;de=de+1
-	dcr	b		;decrement count
-	jnz	vecLp		;next vector
-
-	ret			;done
+initVec	lxi	d,RAMVECS	;DE->BIOS jumpers in interface RAM
+	mvi	b,8		;copy 8 vectors
 
 ;--------------------------------------------------------------------------
-; PROM I/O Routines
+; copyVec - copy eight entry vector table from (HL) to (DE). Inserts
+;    a JMP instruction for each vector address
 ;--------------------------------------------------------------------------
+copyVec	mvi	a,JMP		;store JMP instruction
+	stax	d
+	inx	d
 
-;*** ALTAIR 88-2SIO ROUTINES ***
+	mov	a,m		;move vector LSB
+	stax	d
+	inx	h
+	inx	d
 
-SSS	EQU	10h		;2SIO status port
-SSI	EQU	11h		;2SIO input port
-SSO	EQU	11h		;2SIO output port
-SSDA	EQU	01h		;data available mask
-SSBE	EQU	02h		;buffer empty mask
+	mov	a,m		;move vector MSB
+	stax	d
+	inx	h
+	inx	d
 
-SIOINIT	mvi	a,03h		;reset
-	out	SSS
-	mvi	a,11h		;8 data bits, 2 stop bits
-	out	SSS
+	dcr	b		;do next vector
+	jnz	copyVec
+
+	ret
+	
+;--------------------------------------------------------------------------
+; 88-2SIO drivers
+;--------------------------------------------------------------------------
+; Initialize 2SIO port
+
+sio2Ini	mvi	a,03h		;reset ACIA
+	out	10h
+	mvi	a,11h		;set 8N2
+	out	10h
 	ret
 
-SIOST	in	SSS
+; sio2St - BIOS conSt function
+
+sio2St	in	10h		;test status port for 
+	ani	01h		;  byte available
+	mvi	a,0		;return zero if not
+	rz
+	cma			;else FF if present
+	ret
+
+; sio2In - BIOS conIn function
+
+sio2In	in	10h		;wait for byte to be available
 	ani	01h
-	mvi	a,0
-	rz			;return A=0 if no key
+	jz	sio2In
 
-	cma			;return A=0FFh if key
-	ret
-
-SIOIN	in	SSS
-	ani	01h
-	jz	SIOIN		;no data yet
-
-	in	SSI
-	ani	07fh
-	jz	SIOIN
+	in	11h		;A=new character
+	ani	7Fh		;get rid of parity bit
+	jz	sio2In		;if null, ignore it
 
 	ret
- 
-SIOUT	in	SSS
+
+; sio2Out - BIOS conOut function
+
+sio2Out	in	10h		;wait for transmitter empty
 	ani	02h
-	jz	SIOUT		;not ready for output
-	mov	a,c
-	out	SSO		;output byte
+	jz	sio2Out
+
+	mov	a,c		;transmit character from C
+	out	11h
 	ret
 
-	ret			;here from PROM image
+return1	ret
+	
+return2	ret
 
-SIORET	ret			;no warm init done
+;--------------------------------------------------------------------------
+; 88-SIO drivers
+;--------------------------------------------------------------------------
+; sioSt - BIOS conSt function
 
-;*** IMSAI (MITS REV NON-ZERO) I/O ROUTINE ***
-
-TTS	EQU	0		;STATUS PORT
-TTI	EQU	1		;DATA INPUT PORT
-TTO	EQU	1		;DATA OUTPUT PORT
-TTDA	EQU	1		;DATA AVAILABLE PORT
-TTBE	EQU	80H		;BUFFER EMPTY PORT
-
-TTYST	in	TTS
-	ani	TTDA
-	mvi	a,0
-	rnz			;return A=0 if no key
-	cma			;return A=FFh if key
-
+sioSt	in	00h		;test status port for
+	ani	01h		;  byte available
+	mvi	a,0		;return zero if not
+	rnz
+	cma			;else FF if present
 	ret
 
-TTYIN	in	TTS
-	ani	TTDA
-	jnz	TTYIN		;loop for char
+; sioIn - BIOS conIn function
 
-	in	TTI		;get char
-	ani	07fh		;strip parity
-	jz	TTYIN
-
+sioIn	in	00h		;wait for byte to be available
+	ani	01h
+	jnz	sioIn
+	
+	in	01h		;get the byte
+	ani	7Fh		;get rid of parity
+	jz	sioIn		;if null, ignore it
+	
 	ret
 
-TTYOUT	in	TTS
-	ani	TTBE
-	jnz	TTYOUT		;loop until ready
+; sioOut - BIOS conOut function
 
-	mov	a,c
-	out	TTO		;output char
-
+sioOut	in	00h		;wait for transmitter empty
+	ani	80h
+	jnz	sioOut
+	
+	mov	a,c		;transmit byte from C
+	out	01h
 	ret
 
-;*** CENTRONIX PRINTER ***
-
-CENTC	equ	2		;CENTRONICS CONTROL PORT
-CENTD	equ	3		;CENTRONICS DATA PORT
-
-LPTPOS	equ	PRAM+047h	;POSITION
-LPTLEN	equ	PRAM+048h	;DOUBLES AS INIT FLAG
-LPTLST	equ	PRAM+049h	;LAST CHAR
-
-;CENTRONICS PRINTER OUTPUT ROUTINE
-
-CENTOUT	lda	LPTLEN
-	ora	a		;init?
-	jnz	LPTOT1		;already init
-
-INITCP	mvi	a,011h
-	out	CENTD
+;--------------------------------------------------------------------------
+; Line printer driver - BIOS list device output routine
+;--------------------------------------------------------------------------
+lptOut	lda	lptLen		;length of zero means init printer
+	ora	a
+	jnz	lptOutC		;init already done
+	
+	mvi	a,11h		;init the printer
+	out	03h
 	xra	a
-	out	CENTC
-	sta	LPTPOS
-	mvi	a,132
-	sta	LPTLEN		;set max line length
-
-LPTOT1	mov	a,c		;get character
-	cpi	LF		;ignore LF
-	jnz	LPTOT2		;if first character on line
-
-	sta	LPTLST
-	lda	LPTPOS
+	out	02h
+	
+	sta	lptPos		;at position zero in line buffer
+	mvi	a,132		;set max line length
+	sta	lptLen
+	
+lptOutC	mov	a,c		;line feed?
+	cpi	LF
+	jnz	notLf		;no
+	
+	sta	lptPrev		;save LF as last character
+	lda	lptPos		;anything buffered to print?
 	ora	a
-	rz
-
-LPTOT2	mov	a,c
+	rz			;no, probably LF after CR
+	
+notLf	mov	a,c		;back space? (reverse line feed?)
 	cpi	BS
-	jz	LPTWAT
-	cpi	TAB
-	jz	MORSPC
-	cpi	CR
-	jz	CRTRIK
-	rc			;ignore other control chars
-				;make sure form feeds ignored
-
-	lda	LPTPOS
+	jz	waitLpt		;yes, send direct to printer
+	
+	cpi	TAB		;tab?
+	jz	doTab		;yes
+	
+	cpi	CR		;carriage return?
+	jz	doCr		;yes
+	rc			;exit for characters < CR
+	
+	lda	lptPos		;increment the buffer position
 	inr	a
-	push	h
-	lxi	h,LPTLEN
-	cmp	m
+	
+	push	h		;preserve H
+	lxi	h,lptLen	;compare position to line length
+	cmp	m		;have room for another character?
 	pop	h
-	jnz	NOTENL
+	jnz	havRoom		;yes
+				;else, fall into doCr to force print
 
-; Special handling for CR
-
-CRTRIK	lda	LPTPOS		;position 0?
+doCr	lda	lptPos		;at start of buffer?
 	ora	a
-	jnz	ATENL		;print CR if not end of line
-
-	lda	LPTLST		;ignore 2 CR in a row
+	jnz	notBlnk		;no
+	
+	lda	lptPrev		;previous byte a CR?
 	cpi	CR
-	rz
-
-	mvi	c,LF		;change pos 0 CR to LF
-
-ATENL	xra	a
-
-NOTENL	sta	LPTPOS		;save position of char
-	mov	a,c
-	sta	LPTLST		;store last char
-
-LPTWAT	in	CENTC
-	ani	011h
-	jz	LPTWAT		;not ready to output
-
-	mov	a,c
-	out	CENTD		;send char to printer
-
+	rz			;yes, ignore two CRís in a row
+	mvi	c,LF		;force line feed (print) for CR
+	
+notBlnk	xra	a		;zero the line buffer position
+	
+havRoom	sta	lptPos		;update line buffer position
+	mov	a,c		;save character just printed
+	sta	lptPrev
+	
+waitLpt	in	02H		;wait for printer ready
+	ani	11H
+	jz	waitLpt
+	
+	mov	a,c		;output character to printer
+	out	03H
 	ret
 
-MORSPC	mvi	c,' '		;handle TAB
-	call	LPTOT1
+doTab	mvi	c,' '		;space fill the tab
+	call	lptOutC		;output the space
+	
+	lda	lptPos		;fill until next tab stop reached
+	ani	07h		;tabs are every 8 bytes
+	jnz	doTab
+	
+	ret
+	
+;--------------------------------------------------------------------------
+; Monitor PROM I/O drivers
+;--------------------------------------------------------------------------
+; BIOS vectors for I/O through monitor PROM at C000h
 
-	lda	LPTPOS
-	ani	07h
-	jnz	MORSPC
+monVec	dw	monIni		;init during cold start
+	dw	return2		;no action during watm start
+	dw	monSt		;console status
+	dw	monIn		;console input
+	dw	monOut		;console output
+	dw	lptOut		;list output
+	dw	monOut		;punch out
+	dw	monIn		;reader in
 
-	ret			;done
+; monIn - BIOS conIn routine
 
-	;
-	; match the PROM
-	;
+monIn	call	monChk		;wait for new byte available
+	jz	monIn
+	
+	mov	a,m		;get the new byte
+	ani	7Fh		;strip parity
+	mvi	m,0		;nothing in input buffer anymore
+	ret
 
-	db	0a8h,0f3h,0d2h,0f2h,0a1h,0f3h,078h,0f3h
-	db	08eh,0f3h,0f6h,0f2h,08eh,0f3h,078h,0f3h
-	db	0cdh,084h,0f3h,0cah,078h,0f3h,07eh,0e6h
-	db	07fh,036h,000h,0c9h,021h,04bh,0f4h,07eh
-	db	0b7h,0cch,01fh,0c0h,077h,0c9h,03ah,04ah
-	db	0f4h,0feh,00dh,0c2h,098h,0f3h,0b9h,0c8h
-	db	079h,032h,04ah,0f4h,041h,0cdh,019h,0c0h
-	db	0c9h,0cdh,084h,0f3h,0c8h,03eh,0ffh,0c9h
-	db	021h,000h,000h,022h,04ah,0f4h,0c9h,0ffh
+; monChk - check if new input character available. Return zero if
+;    not, non-zero if so.
 
-	db	0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh
-	db	0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh
-	db	0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh
-	db	0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh
-	db	0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh
-	db	0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh
+monChk	lxi	h,bufChr	;HL->received byte, else zero
+	mov	a,m		;is a byte already there?
+	ora	a
+	cz	0C01Fh		;no, go see if new byte available
+	mov	m,a		;save it (zero means no data)
+	ret
 
-	db	0d1h,0f2h,0d2h,0f2h,0d3h,0f2h,0dch,0f2h
-	db	0ebh,0f2h,0f6h,0f2h,0ebh,0f2h,0dch,0f2h
+; monOut - BIOS conOut routine
+
+monOut	lda	prevChr		;check for two CR in a row
+	cpi	CR		;this and previous both CR?
+	jnz	notCr		;no
+	cmp	c
+	rz			;yes, skip 2nd CR
+	
+notCr	mov	a,c		;save last character displayed
+	sta	prevChr
+	mov	b,c
+	call	0C019h		;go display it
+	ret
+
+; monSt - BIOS conSt routine
+
+monSt	call	monChk
+	rz
+	mvi	a,0FFh
+	ret
+
+; monIni - cold start initialzation
+
+monIni	lxi	h,0		;set prev char and buffered char to zero
+	shld	prevChr
+	ret
+
+; Match PROM
+
+	db	0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh
+	db	0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh
+	db	0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh
+	db	0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh
+	db	0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh
 
 ;--------------------------------------------------------------------------
-; PROM I/O vector table
+; BIOS vectors for 88-SIO console
 ;--------------------------------------------------------------------------
+sioVec	dw	return1		;nothing during cold start
+	dw	return2		;nothing during warm start
+	dw	sioSt		;console status
+	dw	sioIn		;console input
+	dw	sioOut		;console output
+	dw	lptOut		;list output
+	dw	sioout		;punch output
+	dw	sioin		;reader input
 
-VCINIT	dw	SIOINIT		;cold start init
-VWINIT	dw	SIORET		;warm start init
-VCONST	dw	SIOST		;console status
-VCONIN	dw	SIOIN		;console in
-VCONOUT	dw	SIOUT		;console out
-VLIST	dw	CENTOUT		;list
-VPUNCH	dw	SIOUT		;punch
-VREADER	dw	SIOIN		;reader f3fe b7 f2
+;--------------------------------------------------------------------------
+; BIOS vectors for 88-2SIO console
+;--------------------------------------------------------------------------
+sio2Vec	dw	sio2Ini		;init port during cold start
+	dw	return2		;nothing during warm start
+	dw	sio2St		;console status
+	dw	sio2In		;console input
+	dw	sio2Out		;console output
+	dw	lptOut		;list output
+	dw	sio2out		;punch output
+	dw	sio2in		;reader input
 
 	end
+
